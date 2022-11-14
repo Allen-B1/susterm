@@ -5,6 +5,7 @@ pub struct Entry {
     pub format: Format,
     pub text: Vec<u8>,
     pub max: usize,
+    pub handle_input: Box<dyn FnMut(&[u8]) + Send>
 }
 
 impl Widget for Entry {
@@ -45,5 +46,6 @@ impl Widget for Entry {
                 self.text.push(ch);
             }
         }
+        (self.handle_input)(&self.text);
     }
 }

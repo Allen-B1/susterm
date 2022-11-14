@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::{Arc, Weak, Mutex}, fmt::Write};
+use std::{net::SocketAddr, sync::{Arc, Weak, Mutex}, fmt::Write, ops::DerefMut};
 
 use dashmap::DashMap;
 use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt, AsyncWrite}};
@@ -65,14 +65,29 @@ pub trait Widget: Send {
 }
 
 pub struct Screen {
-    pub widgets: Vec<Mutex<Box<dyn Widget>>>,
-    pub active: Option<usize>,
-    pub width: usize,
-    pub height: usize,
+    buf: ScreenBuffer,
+
+    widgets: Vec<Arc<Mutex<Box<dyn Widget>>>>,
+    active: Option<usize>,
 }
 
 impl Screen {
-    pub async fn draw(&self, writer: &mut (impl AsyncWrite + Unpin), old_buf: ScreenBuffer) -> ScreenBuffer {
+    pub fn new(widgets: Vec<Arc<Mutex<Box<dyn Widget>>>>, active: Option<usize>, width: usize, height: usize) -> Screen {
+        Screen {
+            buf: ScreenBuffer {
+                chars: vec![' ' as u8; width * height],
+                formats: vec![Format { fg: Color::Default, bg: Color::Default, bold: false, underline: false }; width * height ],
+                width
+            },
+            widgets, active
+        }
+    }
+
+    /// Updates the internal `ScreenBuffer` and sends the diff
+    /// to the given writer.
+    pub async fn draw(&mut self, writer: &mut (impl AsyncWrite + Unpin)) {
+        let old_buf = &self.buf;
+
         let mut new_buf=  ScreenBuffer {
             chars: vec![' ' as u8 ; old_buf.chars.len()],
             formats: vec![Format { fg: Color::White, bg: Color::Black, bold: false, underline: false }; old_buf.chars.len()],
@@ -103,14 +118,14 @@ impl Screen {
                 write!(msg, "{}", new_buf.chars[idx] as char).unwrap();
             }
         }
-        write!(msg, "\x1b[{};{}H", cursor_y, cursor_x);
+        write!(msg, "\x1b[{};{}H", cursor_y, cursor_x).unwrap();
 
         // Send the message over TCP.
         if let Err(err) = writer.write(msg.as_bytes()).await { 
             eprintln!("error drawing screen: {}", err);
         }
 
-        new_buf
+        self.buf = new_buf;
     }
 }
 
@@ -123,6 +138,39 @@ pub struct Server {
 }
 
 impl Server {    
+    /// Redraw a particular screen. (By default, a screen
+    /// is only redrawn on user input.)
+    pub async fn redraw(&self, addr: SocketAddr) -> bool {
+        let screen = self.screens.get_mut(&addr);
+        let mut screen = match screen {
+            None => return false,
+            Some(s) => s,
+        };
+
+        let stream = self.streams.get_mut(&addr);
+        let mut stream = match stream {
+            None => return false,
+            Some(s) => s,
+        };
+
+        screen.draw(stream.deref_mut()).await;
+
+        true
+    }
+
+    /// Redraw all screens.
+    pub async fn redraw_all(&self) -> bool {
+        let vec = self.screens.iter().map(|multiref| *multiref.pair().0).collect::<Vec<_>>();
+        let mut ret = true;
+        for addr in vec {
+            if !self.redraw(addr).await {
+                ret = false;
+            }
+        }
+        ret
+    }
+
+    /// Creates a new server.
     pub fn new(srv: TcpListener, handle_connect: impl (Fn(Weak<Self>, SocketAddr) -> Screen) + Sync + Send + 'static) -> Arc<Self> {
         Arc::new(Server {
             srv, 
@@ -137,7 +185,6 @@ impl Server {
     /// Runs an infinite loop handling events for the given address.
     /// Invariants: `TcpStream` and `Screen` must be set.
     async fn event_thread(this: Weak<Self>, addr: SocketAddr) {
-        let mut buffer: ScreenBuffer;
         {   // Clear screen & initialize buffer
             let this = this.upgrade();
             let this = match this {
@@ -159,18 +206,13 @@ impl Server {
                 }
             }
 
-            let screen = this.screens.get(&addr);
-            let screen = match screen {
+            let screen = this.screens.get_mut(&addr);
+            let mut screen = match screen {
                 None => return,
                 Some(v) => v,
             };
 
-            buffer = ScreenBuffer {
-                chars: vec![' ' as u8; screen.width * screen.height],
-                formats: vec![Format { fg: Color::Default, bg: Color::Default, bold: false, underline: false }; screen.width * screen.height ],
-                width: screen.width,
-            };
-            buffer = screen.draw(stream.value_mut(), buffer).await;
+            screen.draw(stream.value_mut()).await;
 
             drop(screen);
             drop(stream);
@@ -190,15 +232,15 @@ impl Server {
                 Some(v) => v,
             };
 
-            let screen = this.screens.get_mut(&addr);
-            let mut screen = match screen {
-                None => continue,
-                Some(v) => v,
-            };
-
             let mut buf: [u8; 1] = [0u8];
             match stream.read(&mut buf).await {
                 Ok(bytes) => {
+                    let screen = this.screens.get_mut(&addr);
+                    let mut screen = match screen {
+                        None => continue,
+                        Some(v) => v,
+                    };
+
                     if bytes == 0 {
                         return
                     }
@@ -228,7 +270,12 @@ impl Server {
                 }
             }
 
-            buffer = screen.draw(stream.value_mut(), buffer).await;
+            let screen = this.screens.get_mut(&addr);
+            let mut screen = match screen {
+                None => continue,
+                Some(v) => v,
+            };
+            screen.draw(stream.value_mut()).await;
 
             drop(screen);
         }
